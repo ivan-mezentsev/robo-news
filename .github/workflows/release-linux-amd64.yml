@@ -51,6 +51,12 @@ jobs:
           - crate: translator
             dir: translator
             bin: translator
+          - crate: rewriter
+            dir: rewriter
+            bin: rewriter
+          - crate: illustrator
+            dir: illustrator
+            bin: illustrator
           - crate: publisher
             dir: publisher
             bin: publisher
