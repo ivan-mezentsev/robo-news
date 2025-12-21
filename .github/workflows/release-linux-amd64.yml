@@ -39,21 +39,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - crate: downloader-feed1
-            dir: downloader-feed1
-            bin: downloader-feed1
           - crate: parser-feed1
             dir: parser-feed1
             bin: parser-feed1
-          - crate: publisher
-            dir: publisher
-            bin: publisher
+          - crate: downloader-feed1
+            dir: downloader-feed1
+            bin: downloader-feed1
           - crate: scraper
             dir: scraper
             bin: scraper
           - crate: translator
             dir: translator
             bin: translator
+          - crate: publisher
+            dir: publisher
+            bin: publisher
     steps:
       - name: Checkout
         uses: actions/checkout@v5
