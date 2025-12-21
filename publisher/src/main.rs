@@ -1,14 +1,13 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
+use reqwest::blocking::multipart;
 use rusqlite::{params, Connection};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::collections::HashMap;
 use std::{thread, time::Duration};
 use scraper::{Html, Selector, ElementRef};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use chrono::{DateTime, NaiveDateTime};
 
@@ -18,10 +17,6 @@ const PUBLISH_INTERVAL_SECS: u64 = 60; // 1 minute
 
 // Telegram Bot API limits (see docs referenced in issue)
 const TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16: usize = 4096;
-
-// Telegraph API limits (see https://telegra.ph/api#createPage)
-const TELEGRAPH_CREATEPAGE_CONTENT_LIMIT_BYTES: usize = 64 * 1024;
-const TELEGRAPH_API_BASE: &str = "https://api.telegra.ph";
 
 struct NewsItem {
     id: String,
@@ -72,13 +67,6 @@ fn check_env_vars() -> Result<()> {
     if tg_chat_id.is_empty() {
         return Err(anyhow!("TG_CHAT_ID environment variable is empty"));
     }
-
-    let telegraph_access_token = env::var("TELEGRAPH_ACCESS_TOKEN")
-        .context("TELEGRAPH_ACCESS_TOKEN environment variable is not set")?;
-
-    if telegraph_access_token.is_empty() {
-        return Err(anyhow!("TELEGRAPH_ACCESS_TOKEN environment variable is empty"));
-    }
     
     Ok(())
 }
@@ -101,17 +89,17 @@ fn init_data_dir() -> Result<()> {
 }
 
 fn run_publisher(conn: &Connection) -> Result<()> {
-    log("[INFO] Checking for translated news items to publish")?;
+    log("[INFO] Checking for illustrator news items to publish")?;
     
-    // Fetch news items with "translated" status
-    let news_items = fetch_translated_items(conn)?;
+    // Fetch news items with "illustrator" status
+    let news_items = fetch_illustrator_items(conn)?;
     
     if news_items.is_empty() {
-        log("[INFO] No translated items to publish")?;
+        log("[INFO] No illustrator items to publish")?;
         return Ok(());
     }
     
-    log(&format!("[INFO] Found {} translated items to publish", news_items.len()))?;
+    log(&format!("[INFO] Found {} illustrator items to publish", news_items.len()))?;
     
     // Process and publish each news item
     for item in news_items {
@@ -170,8 +158,8 @@ fn run_publisher(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn fetch_translated_items(conn: &Connection) -> Result<Vec<NewsItem>> {
-    let mut stmt = conn.prepare("SELECT id, title, url, date, status FROM news WHERE status = 'translated' ORDER BY date ASC")?;
+fn fetch_illustrator_items(conn: &Connection) -> Result<Vec<NewsItem>> {
+    let mut stmt = conn.prepare("SELECT id, title, url, date, status FROM news WHERE status = 'illustrator' ORDER BY date ASC")?;
     let news_iter = stmt.query_map([], |row| {
         Ok(NewsItem {
             id: row.get(0)?,
@@ -192,7 +180,7 @@ fn fetch_translated_items(conn: &Connection) -> Result<Vec<NewsItem>> {
 }
 
 fn process_html_file(item: &NewsItem) -> Result<()> {
-    let input_path = format!("{}/translator_{}.html", DATA_DIR, item.id);
+    let input_path = format!("{}/rewriter_{}.html", DATA_DIR, item.id);
     let output_path = format!("{}/publisher_{}.html", DATA_DIR, item.id);
     
     // Read the input file
@@ -321,6 +309,7 @@ fn send_to_telegram(item: &NewsItem) -> Result<()> {
     let chat_id = env::var("TG_CHAT_ID").context("Failed to get TG_CHAT_ID")?;
     
     let file_path = format!("{}/publisher_{}.html", DATA_DIR, item.id);
+    let image_path = format!("{}/illustrator_{}.png", DATA_DIR, item.id);
     
     // Read the file content
     let mut file = File::open(&file_path)
@@ -338,271 +327,94 @@ fn send_to_telegram(item: &NewsItem) -> Result<()> {
     content.push_str(&format!("\n\nОпубликовано: {}\n<a href=\"{}\">Читать оригинал</a>", 
                               formatted_date, item.url));
 
+    // Always: send photo WITHOUT caption, then send the post as a separate message.
+    if !Path::new(&image_path).exists() {
+        return Err(anyhow!("Illustrator image not found: {}", image_path));
+    }
+
+    let client = Client::new();
+
+    send_photo(&client, &token, &chat_id, &image_path, None)?;
+    send_message_no_fallback(&client, &token, &chat_id, &content)?;
+    Ok(())
+}
+
+fn send_photo(client: &Client, token: &str, chat_id: &str, image_path: &str, caption: Option<&str>) -> Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendPhoto", token);
+
+    let image_bytes = fs::read(image_path)
+        .context(format!("Failed to read illustrator image: {}", image_path))?;
+
+    let mut form = multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part(
+            "photo",
+            multipart::Part::bytes(image_bytes)
+                .file_name(
+                    Path::new(image_path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .mime_str("image/png")
+                .context("Failed to set mime type for photo")?,
+        )
+        .text("parse_mode", "HTML".to_string());
+
+    if let Some(c) = caption {
+        form = form.text("caption", c.to_string());
+    }
+
+    let response = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .context("Failed to send sendPhoto request to Telegram API")?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow!("Telegram API error (sendPhoto): {}", error_text));
+    }
+
+    Ok(())
+}
+
+fn send_message_no_fallback(
+    client: &Client,
+    token: &str,
+    chat_id: &str,
+    html_message: &str,
+) -> Result<()> {
     // Telegram Bot API sendMessage: text is limited to 1-4096 characters AFTER entities parsing.
     // We approximate by stripping HTML tags and counting UTF-16 code units.
-    let approx_len_utf16 = telegram_text_len_utf16_after_entities_guess(&content);
+    let approx_len_utf16 = telegram_text_len_utf16_after_entities_guess(html_message);
     if approx_len_utf16 > TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16 {
-        log(&format!(
-            "[WARN] Telegram message too long (approx {} UTF-16 units, limit {}), publishing to telegra.ph",
-            approx_len_utf16, TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16
-        ))?;
-
-        let client = Client::new();
-        let telegraph_url = publish_to_telegraph(&client, item, &content)?;
-
-        // Keep telegra.ph link first so preview uses it. Explicitly enable preview via link_preview_options.
-        let fallback_message = format!(
-            "<b>{}</b>\n\nПолный текст: {}\n\nОпубликовано: {}\n<a href=\"{}\">Читать оригинал</a>",
-            item.title, telegraph_url, formatted_date, item.url
-        );
-
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-        let response = client
-            .post(&url)
-            .json(&json!({
-                "chat_id": chat_id,
-                "text": fallback_message,
-                "parse_mode": "HTML",
-                "link_preview_options": {
-                    "is_disabled": false,
-                    "url": telegraph_url
-                }
-            }))
-            .send()
-            .context("Failed to send telegra.ph fallback message to Telegram API")?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("Telegram API error: {}", error_text));
-        }
-
-        return Ok(());
+        return Err(anyhow!(
+            "Telegram message too long (approx {} UTF-16 units, limit {}). No fallback is configured.",
+            approx_len_utf16,
+            TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16
+        ));
     }
-    
-    // Send the message to Telegram
-    let client = Client::new();
+
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-    
-    let response = client.post(&url)
+    let response = client
+        .post(&url)
         .json(&json!({
             "chat_id": chat_id,
-            "text": content,
+            "text": html_message,
             "parse_mode": "HTML",
             "disable_web_page_preview": true
         }))
         .send()
         .context("Failed to send request to Telegram API")?;
-    
+
     if !response.status().is_success() {
         let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow!("Telegram API error: {}", error_text));
+        return Err(anyhow!("Telegram API error (sendMessage): {}", error_text));
     }
-    
+
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegraphCreatePageResponse {
-    ok: bool,
-    #[serde(default)]
-    result: Option<TelegraphCreatePageResult>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TelegraphCreatePageResult {
-    url: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum TelegraphNode {
-    Text(String),
-    Element(TelegraphNodeElement),
-}
-
-#[derive(Debug, Serialize)]
-struct TelegraphNodeElement {
-    tag: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attrs: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    children: Option<Vec<TelegraphNode>>,
-}
-
-fn publish_to_telegraph(client: &Client, item: &NewsItem, html_message: &str) -> Result<String> {
-    let access_token = env::var("TELEGRAPH_ACCESS_TOKEN").context("Failed to get TELEGRAPH_ACCESS_TOKEN")?;
-
-    let title = sanitize_telegraph_title(&item.title);
-
-    let safe_html_message = truncate_to_max_bytes_utf8(html_message, TELEGRAPH_CREATEPAGE_CONTENT_LIMIT_BYTES);
-    let nodes = build_telegraph_nodes_from_html_message(&safe_html_message)?;
-    let content_json = serde_json::to_string(&nodes).context("Failed to serialize Telegraph nodes")?;
-
-    let endpoint = format!("{}/createPage", TELEGRAPH_API_BASE);
-    let response = client
-        .post(&endpoint)
-        .form(&[
-            ("access_token", access_token.as_str()),
-            ("title", title.as_str()),
-            ("content", content_json.as_str()),
-            ("return_content", "false"),
-        ])
-        .send()
-        .context("Failed to send request to Telegraph API")?;
-
-    let status = response.status();
-    let body = response.text().unwrap_or_else(|_| "".to_string());
-    if !status.is_success() {
-        return Err(anyhow!("Telegraph API HTTP error {}: {}", status, body));
-    }
-
-    let parsed: TelegraphCreatePageResponse = serde_json::from_str(&body)
-        .context("Failed to parse Telegraph API response")?;
-    if !parsed.ok {
-        return Err(anyhow!(
-            "Telegraph API error: {}",
-            parsed.error.unwrap_or_else(|| "Unknown error".to_string())
-        ));
-    }
-
-    let page = parsed.result.context("Telegraph API response missing result")?;
-    Ok(page.url)
-}
-
-fn sanitize_telegraph_title(title: &str) -> String {
-    let t = title.trim();
-    let t = if t.is_empty() { "News" } else { t };
-    // Telegraph API: title 1-256 characters
-    t.chars().take(256).collect()
-}
-
-fn truncate_to_max_bytes_utf8(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-
-    // Keep a small suffix for the truncation note.
-    let suffix = "\n\n[truncated]";
-    let budget = max_bytes.saturating_sub(suffix.len());
-    let mut out = String::new();
-    for ch in s.chars() {
-        if out.len() + ch.len_utf8() > budget {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str(suffix);
-    out
-}
-
-fn build_telegraph_nodes_from_html_message(html_message: &str) -> Result<Vec<TelegraphNode>> {
-    // Convert our Telegram-HTML-ish message (with newlines) into a minimal HTML document
-    // with paragraphs, then parse and convert into Telegraph Nodes.
-    let mut body_html = String::new();
-    for (i, para) in html_message.split("\n\n").enumerate() {
-        let para = para.trim();
-        if para.is_empty() {
-            continue;
-        }
-        if i > 0 {
-            body_html.push('\n');
-        }
-        body_html.push_str("<p>");
-        body_html.push_str(&para.replace('\n', "<br>"));
-        body_html.push_str("</p>");
-    }
-
-    let doc = Html::parse_document(&format!("<html><body>{}</body></html>", body_html));
-    let body_selector = Selector::parse("body").map_err(|e| anyhow!("Invalid selector: {}", e))?;
-    let body = doc
-        .select(&body_selector)
-        .next()
-        .ok_or_else(|| anyhow!("Body tag not found in generated HTML"))?;
-
-    let mut nodes = Vec::new();
-    nodes.extend(telegraph_nodes_from_children(&body));
-    Ok(nodes)
-}
-
-fn telegraph_nodes_from_children(element: &ElementRef) -> Vec<TelegraphNode> {
-    let mut out = Vec::new();
-    let mut last_was_space = true;
-    for child in element.children() {
-        match child.value() {
-            scraper::node::Node::Text(text) => {
-                let raw = text.text.to_string();
-                if raw.is_empty() {
-                    continue;
-                }
-
-                if raw.trim().is_empty() {
-                    // Preserve a single whitespace between inline elements.
-                    if !out.is_empty() && !last_was_space {
-                        out.push(TelegraphNode::Text(" ".to_string()));
-                        last_was_space = true;
-                    }
-                } else {
-                    last_was_space = raw.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
-                    out.push(TelegraphNode::Text(raw));
-                }
-            }
-            scraper::node::Node::Element(_) => {
-                if let Some(child_element) = ElementRef::wrap(child) {
-                    if let Some(node) = telegraph_node_from_element(&child_element) {
-                        out.push(node);
-                        last_was_space = false;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn telegraph_node_from_element(element: &ElementRef) -> Option<TelegraphNode> {
-    let tag = element.value().name().to_lowercase();
-
-    // Telegraph supports a strict tag set.
-    let allowed = [
-        "a", "aside", "b", "blockquote", "br", "code", "em", "figcaption", "figure", "h3", "h4",
-        "hr", "i", "iframe", "img", "li", "ol", "p", "pre", "s", "strong", "u", "ul", "video",
-    ];
-
-    if !allowed.contains(&tag.as_str()) {
-        // Unknown tag: flatten to children.
-        let flattened = telegraph_nodes_from_children(element);
-        if flattened.is_empty() {
-            None
-        } else {
-            Some(TelegraphNode::Element(TelegraphNodeElement {
-                tag: "p".to_string(),
-                attrs: None,
-                children: Some(flattened),
-            }))
-        }
-    } else {
-        let mut attrs: Option<HashMap<String, String>> = None;
-        for (k, v) in element.value().attrs() {
-            if k == "href" || k == "src" {
-                if attrs.is_none() {
-                    attrs = Some(HashMap::new());
-                }
-                if let Some(map) = attrs.as_mut() {
-                    map.insert(k.to_string(), v.to_string());
-                }
-            }
-        }
-
-        let children = telegraph_nodes_from_children(element);
-        Some(TelegraphNode::Element(TelegraphNodeElement {
-            tag,
-            attrs,
-            children: if children.is_empty() { None } else { Some(children) },
-        }))
-    }
 }
 
 fn telegram_text_len_utf16_after_entities_guess(html_text: &str) -> usize {
