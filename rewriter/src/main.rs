@@ -264,7 +264,7 @@ fn run_rewriter(conn: &Connection, provider: &AiProviderConfig) -> Result<()> {
 }
 
 fn fetch_items_to_rewrite(conn: &Connection) -> Result<Vec<NewsItem>> {
-    let mut stmt = conn.prepare("SELECT id, title, url, date, status FROM news WHERE status = 'translator' OR status = 'rewriter_retry' ORDER BY date ASC")?;
+    let mut stmt = conn.prepare("SELECT id, title, url, date, status FROM news WHERE status = 'translated' OR status = 'rewriter_retry' ORDER BY date ASC")?;
     let news_iter = stmt.query_map([], news_item_from_row)?;
     
     let mut news_items = Vec::new();
