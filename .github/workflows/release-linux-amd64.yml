@@ -1,0 +1,197 @@
+name: Release (linux amd64)
+
+'on':
+  push:
+    tags:
+      - 'v*'
+
+# Default: least privilege. Jobs elevate only if they need to write.
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.87.0'
+  TARGET: x86_64-unknown-linux-gnu
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate_tag:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format (vMAJOR.MINOR.PATCH)
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid tag format: '$TAG'"
+            echo "Expected: vMAJOR.MINOR.PATCH (example: v0.1.0)"
+            exit 1
+          fi
+
+  build:
+    name: "Build (${{ matrix.crate }})"
+    needs: [validate_tag]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: downloader-feed1
+            dir: downloader-feed1
+            bin: downloader-feed1
+          - crate: parser-feed1
+            dir: parser-feed1
+            bin: parser-feed1
+          - crate: publisher
+            dir: publisher
+            bin: publisher
+          - crate: scraper
+            dir: scraper
+            bin: scraper
+          - crate: translator
+            dir: translator
+            bin: translator
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+          rustup target add "${TARGET}"
+          rustc -V
+          cargo -V
+
+      - name: Build (release)
+        working-directory: "${{ matrix.dir }}"
+        run: |
+          cargo build --release --locked --target "${TARGET}"
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.dir }}/target/${TARGET}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.crate }}
+          path: dist/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 1
+
+  upload_to_release:
+    name: Upload binaries to GitHub Release
+    needs: [validate_tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Ensure executables
+        run: |
+          chmod +x dist/*
+          ls -lah dist
+
+      - name: Ensure release exists (by tag)
+        id: ensure_release
+        uses: actions/github-script@v8
+        env:
+          TAG: "${{ github.ref_name }}"
+        with:
+          result-encoding: string
+          script: |
+            const tag = process.env.TAG
+
+            let release
+            try {
+              const res = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag
+              })
+              release = res.data
+            } catch (e) {
+              if (e.status !== 404) throw e
+              const res = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                name: tag,
+                draft: false,
+                prerelease: false,
+                generate_release_notes: false
+              })
+              release = res.data
+            }
+
+            return String(release.id)
+
+      - name: Upload assets to release
+        uses: actions/github-script@v8
+        env:
+          RELEASE_ID: "${{ steps.ensure_release.outputs.result }}"
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path')
+
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const release_id = Number(process.env.RELEASE_ID)
+
+            if (!Number.isFinite(release_id)) {
+              throw new Error(`Invalid RELEASE_ID: ${process.env.RELEASE_ID}`)
+            }
+
+            const distDir = path.join(process.env.GITHUB_WORKSPACE, 'dist')
+            const files = fs.readdirSync(distDir)
+              .map(name => path.join(distDir, name))
+              .filter(p => fs.statSync(p).isFile())
+
+            if (files.length === 0) {
+              throw new Error('No files found in dist/ to upload')
+            }
+
+            // Avoid name collisions: delete existing assets with same name.
+            const existingAssets = await github.paginate(
+              github.rest.repos.listReleaseAssets,
+              { owner, repo, release_id, per_page: 100 }
+            )
+
+            for (const filePath of files) {
+              const name = path.basename(filePath)
+
+              const found = existingAssets.find(a => a.name === name)
+              if (found) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: found.id
+                })
+              }
+
+              const data = fs.readFileSync(filePath)
+
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id,
+                name,
+                data,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': data.length
+                }
+              })
+            }
