@@ -1,22 +1,171 @@
-use anyhow::{Context, Result, anyhow};
-use reqwest::blocking::Client;
-use reqwest::blocking::multipart;
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::{thread, time::Duration};
+use std::path::PathBuf;
+use tokio::time::{sleep, Duration};
 use scraper::{Html, Selector, ElementRef};
-use serde_json::json;
 use chrono::{DateTime, NaiveDateTime};
+
+use grammers_client::{Client as TgClient, InputMessage, SignInError};
+use grammers_mtsender::SenderPool;
+use grammers_session::types::PeerRef;
+use grammers_session::Session;
+use grammers_session::SessionData;
+use grammers_session::types::{ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
 
 const DB_PATH: &str = "data/news.db";
 const DATA_DIR: &str = "data";
 const PUBLISH_INTERVAL_SECS: u64 = 60; // 1 minute
 
-// Telegram Bot API limits (see docs referenced in issue)
-const TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16: usize = 4096;
+// Telegram user API (grammers) session storage
+const TG_SESSION_PATH: &str = "data/telegram.session";
+
+struct TelegramContext {
+    client: TgClient,
+    target_chat: PeerRef,
+    #[allow(dead_code)]
+    session: Arc<FileSession>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSessionData {
+    home_dc: i32,
+    dc_options: HashMap<i32, DcOption>,
+    peer_infos: HashMap<PeerId, PeerInfo>,
+    updates_state: UpdatesState,
+}
+
+impl Default for PersistedSessionData {
+    fn default() -> Self {
+        let data = SessionData::default();
+        Self {
+            home_dc: data.home_dc,
+            dc_options: data.dc_options,
+            peer_infos: data.peer_infos,
+            updates_state: data.updates_state,
+        }
+    }
+}
+
+/// JSON-backed session storage for grammers.
+///
+/// We use this to persist the session under `data/telegram.session` without introducing a second
+/// native sqlite3 dependency (rusqlite already links sqlite3).
+struct FileSession {
+    path: PathBuf,
+    data: std::sync::Mutex<PersistedSessionData>,
+}
+
+impl FileSession {
+    fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+
+        let data = if path.exists() {
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read telegram session file: {}", path.display()))?;
+            serde_json::from_str::<PersistedSessionData>(&raw)
+                .with_context(|| format!("Failed to parse telegram session JSON: {}", path.display()))?
+        } else {
+            PersistedSessionData::default()
+        };
+
+        let session = Self {
+            path,
+            data: std::sync::Mutex::new(data),
+        };
+
+        // Ensure the file exists on disk even before first login.
+        session.save().ok();
+
+        Ok(session)
+    }
+
+    fn save(&self) -> Result<()> {
+        let tmp_path = self.path.with_extension("session.tmp");
+        let data = self.data.lock().unwrap();
+        let json = serde_json::to_string_pretty(&*data).context("Failed to serialize telegram session")?;
+        fs::write(&tmp_path, json)
+            .with_context(|| format!("Failed to write tmp telegram session: {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("Failed to move tmp session into place: {}", self.path.display()))?;
+        Ok(())
+    }
+
+    fn save_best_effort(&self) {
+        if let Err(e) = self.save() {
+            let _ = log(&format!("[WARN] Failed to persist telegram session: {}", e));
+        }
+    }
+}
+
+impl Session for FileSession {
+    fn home_dc_id(&self) -> i32 {
+        self.data.lock().unwrap().home_dc
+    }
+
+    fn set_home_dc_id(&self, dc_id: i32) {
+        self.data.lock().unwrap().home_dc = dc_id;
+        self.save_best_effort();
+    }
+
+    fn dc_option(&self, dc_id: i32) -> Option<DcOption> {
+        self.data.lock().unwrap().dc_options.get(&dc_id).cloned()
+    }
+
+    fn set_dc_option(&self, dc_option: &DcOption) {
+        self.data
+            .lock()
+            .unwrap()
+            .dc_options
+            .insert(dc_option.id, dc_option.clone());
+        self.save_best_effort();
+    }
+
+    fn peer(&self, peer: PeerId) -> Option<PeerInfo> {
+        self.data.lock().unwrap().peer_infos.get(&peer).cloned()
+    }
+
+    fn cache_peer(&self, peer: &PeerInfo) {
+        self.data
+            .lock()
+            .unwrap()
+            .peer_infos
+            .insert(peer.id(), peer.clone());
+        self.save_best_effort();
+    }
+
+    fn updates_state(&self) -> UpdatesState {
+        self.data.lock().unwrap().updates_state.clone()
+    }
+
+    fn set_update_state(&self, update: UpdateState) {
+        let mut data = self.data.lock().unwrap();
+        match update {
+            UpdateState::All(updates_state) => {
+                data.updates_state = updates_state;
+            }
+            UpdateState::Primary { pts, date, seq } => {
+                data.updates_state.pts = pts;
+                data.updates_state.date = date;
+                data.updates_state.seq = seq;
+            }
+            UpdateState::Secondary { qts } => {
+                data.updates_state.qts = qts;
+            }
+            UpdateState::Channel { id, pts } => {
+                data.updates_state.channels.retain(|c| c.id != id);
+                data.updates_state.channels.push(ChannelState { id, pts });
+            }
+        }
+        drop(data);
+        self.save_best_effort();
+    }
+}
 
 struct NewsItem {
     id: String,
@@ -32,43 +181,205 @@ struct NewsItem {
     error: Option<String>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     // Initialize database and data directory
     let conn = init_db()?;
     init_data_dir()?;
     
     // Check required environment variables
     check_env_vars()?;
+
+    // Initialize Telegram client (user API) and authorize if needed
+    let tg = init_telegram().await?;
     
     log("[INFO] Starting publisher...")?;
     
     // Main loop - run every minute
     loop {
-        if let Err(e) = run_publisher(&conn) {
+        if let Err(e) = run_publisher(&conn, &tg).await {
             log(&format!("[ERROR] Error during publishing: {}", e))?;
         }
         
         log(&format!("[INFO] Sleeping for {} seconds", PUBLISH_INTERVAL_SECS))?;
-        thread::sleep(Duration::from_secs(PUBLISH_INTERVAL_SECS));
+        sleep(Duration::from_secs(PUBLISH_INTERVAL_SECS)).await;
     }
 }
 
 fn check_env_vars() -> Result<()> {
-    let tg_token = env::var("TG_TOKEN")
-        .context("TG_TOKEN environment variable is not set")?;
-    
-    let tg_chat_id = env::var("TG_CHAT_ID")
-        .context("TG_CHAT_ID environment variable is not set")?;
-    
-    if tg_token.is_empty() {
-        return Err(anyhow!("TG_TOKEN environment variable is empty"));
+    let api_id = env::var("TG_API_ID").context("TG_API_ID environment variable is not set")?;
+    let api_hash = env::var("TG_API_HASH").context("TG_API_HASH environment variable is not set")?;
+    let tg_chat_id =
+        env::var("TG_CHAT_ID").context("TG_CHAT_ID environment variable is not set")?;
+
+    if api_id.trim().is_empty() {
+        return Err(anyhow!("TG_API_ID environment variable is empty"));
     }
-    
-    if tg_chat_id.is_empty() {
+
+    if api_hash.trim().is_empty() {
+        return Err(anyhow!("TG_API_HASH environment variable is empty"));
+    }
+
+    if tg_chat_id.trim().is_empty() {
         return Err(anyhow!("TG_CHAT_ID environment variable is empty"));
     }
-    
+
     Ok(())
+}
+
+async fn init_telegram() -> Result<TelegramContext> {
+    // NOTE: API hash is required by the sign-in flow in the current grammers API.
+    // Source evidence:
+    // - https://github.com/Lonami/grammers/blob/master/grammers-client/src/client/auth.rs
+    let api_id: i32 = env::var("TG_API_ID")
+        .context("TG_API_ID is not set")?
+        .trim()
+        .parse()
+        .context("TG_API_ID must be an integer")?;
+    let api_hash = env::var("TG_API_HASH").context("TG_API_HASH is not set")?;
+
+    // Ensure data/ exists (also used for telegram.session)
+    init_data_dir()?;
+
+    // Persistent session storage (JSON file, path name as requested)
+    let session = Arc::new(
+        FileSession::load_or_create(TG_SESSION_PATH)
+            .context(format!("Failed to open telegram session at {}", TG_SESSION_PATH))?,
+    );
+
+    // Sender pool drives network I/O.
+    let pool = SenderPool::new(Arc::clone(&session), api_id);
+    let client = TgClient::new(&pool);
+    let grammers_mtsender::SenderPool { runner, updates, .. } = pool;
+
+    // We don't consume updates in this service. Dropping the receiver makes the sender side
+    // stop delivering them (send() will fail), avoiding unbounded growth.
+    drop(updates);
+
+    tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    ensure_telegram_authorized(&client, &api_hash).await?;
+
+    // Force a final best-effort save after authorization.
+    session.save_best_effort();
+
+    let target_chat = resolve_target_chat(&client).await?;
+
+    Ok(TelegramContext {
+        client,
+        target_chat,
+        session,
+    })
+}
+
+async fn ensure_telegram_authorized(client: &TgClient, api_hash: &str) -> Result<()> {
+    if client.is_authorized().await.context("Telegram authorization check failed")? {
+        return Ok(());
+    }
+
+    log("[INFO] Telegram session is not authorized yet; starting first-run login flow")?;
+
+    let phone = match env::var("TG_PHONE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => prompt_line("Enter phone number (international format, e.g. +14155550132): ")?,
+    };
+
+    let token = client
+        .request_login_code(phone.trim(), api_hash)
+        .await
+        .context("Failed to request Telegram login code")?;
+
+    let code = prompt_line("Enter the login code you received: ")?;
+
+    match client.sign_in(&token, code.trim()).await {
+        Ok(user) => {
+            if let Some(first_name) = user.first_name() {
+                log(&format!("[INFO] Telegram authorized as {}", first_name))?;
+            } else {
+                log("[INFO] Telegram authorized")?;
+            }
+            Ok(())
+        }
+        Err(SignInError::PasswordRequired(password_token)) => {
+            log("[INFO] Telegram 2FA password required")?;
+            let password = prompt_line("Enter 2FA password: ")?;
+            let user = client
+                .check_password(password_token, password.trim().as_bytes())
+                .await
+                .context("Failed to sign in with 2FA password")?;
+            if let Some(first_name) = user.first_name() {
+                log(&format!("[INFO] Telegram authorized as {}", first_name))?;
+            } else {
+                log("[INFO] Telegram authorized")?;
+            }
+            Ok(())
+        }
+        Err(SignInError::SignUpRequired { .. }) => Err(anyhow!(
+            "Telegram sign-up required. Please log in with an official Telegram client first, then rerun publisher."
+        )),
+        Err(e) => Err(anyhow!("Telegram sign-in failed: {}", e)),
+    }
+}
+
+async fn resolve_target_chat(client: &TgClient) -> Result<PeerRef> {
+    let raw = env::var("TG_CHAT_ID").context("TG_CHAT_ID is not set")?;
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(anyhow!("TG_CHAT_ID is empty"));
+    }
+
+    // If it looks like a username (recommended), resolve it once.
+    let looks_like_username = s.starts_with('@') || s.chars().any(|c| c.is_ascii_alphabetic());
+    if looks_like_username {
+        let username = s.trim_start_matches('@');
+        let peer = client
+            .resolve_username(username)
+            .await
+            .context("Failed to resolve TG_CHAT_ID as username")?
+            .ok_or_else(|| anyhow!("Chat @{} not found (TG_CHAT_ID)", username))?;
+
+        return Ok((&peer).into());
+    }
+
+    // Otherwise, attempt to find by numeric ID in dialogs.
+    let wanted_id: i64 = if let Some(rest) = s.strip_prefix("-100") {
+        rest.parse().context("TG_CHAT_ID '-100...' is not numeric")?
+    } else if let Some(rest) = s.strip_prefix('-') {
+        rest.parse().context("TG_CHAT_ID '-...' is not numeric")?
+    } else {
+        s.parse().context("TG_CHAT_ID is not numeric")?
+    };
+
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs
+        .next()
+        .await
+        .context("Failed while iterating Telegram dialogs")?
+    {
+        let peer = dialog.peer();
+        if peer.id().bare_id() == wanted_id {
+            return Ok(peer.into());
+        }
+    }
+
+    Err(anyhow!(
+        "TG_CHAT_ID={} was not found in your dialogs. Use a public username (e.g. @channel) in TG_CHAT_ID.",
+        wanted_id
+    ))
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    // NOTE: Console prompts are used only for the first-run login.
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("Failed to read from stdin")?;
+    Ok(line)
 }
 
 fn init_db() -> Result<Connection> {
@@ -88,7 +399,7 @@ fn init_data_dir() -> Result<()> {
     Ok(())
 }
 
-fn run_publisher(conn: &Connection) -> Result<()> {
+async fn run_publisher(conn: &Connection, tg: &TelegramContext) -> Result<()> {
     log("[INFO] Checking for illustrator news items to publish")?;
     
     // Fetch news items with "illustrator" status
@@ -109,7 +420,7 @@ fn run_publisher(conn: &Connection) -> Result<()> {
         match process_html_file(&item) {
             Ok(_) => {
                 // Send to Telegram
-                match send_to_telegram(&item) {
+                match send_to_telegram(tg, &item).await {
                     Ok(_) => {
                         // Update status to "published"
                         update_status(conn, &item.id, "published", None)?;
@@ -118,31 +429,9 @@ fn run_publisher(conn: &Connection) -> Result<()> {
                     Err(e) => {
                         let error_msg = format!("Failed to send to Telegram: {}", e);
                         log(&format!("[ERROR] {}", error_msg))?;
-                        
-                        // Check if it's a rate limit error
-                        if error_msg.contains("Too Many Requests") {
-                            // Extract retry_after value
-                            let retry_seconds = extract_retry_after(&error_msg).unwrap_or(60);
-                            
-                            log(&format!("[INFO] Rate limit hit, waiting for {} seconds...", retry_seconds))?;
-                            thread::sleep(Duration::from_secs(retry_seconds));
-                            
-                            // Try again
-                            match send_to_telegram(&item) {
-                                Ok(_) => {
-                                    update_status(conn, &item.id, "published", None)?;
-                                    log(&format!("[INFO] Successfully published news item after retry: {}", item.id))?;
-                                }
-                                Err(retry_err) => {
-                                    let retry_error_msg = format!("Failed to send to Telegram after retry: {}", retry_err);
-                                    log(&format!("[ERROR] {}", retry_error_msg))?;
-                                    update_status(conn, &item.id, "publish_error", Some(&retry_error_msg))?;
-                                }
-                            }
-                        } else {
-                            // Update status to "publish_error"
-                            update_status(conn, &item.id, "publish_error", Some(&error_msg))?;
-                        }
+
+                        // Update status to "publish_error"
+                        update_status(conn, &item.id, "publish_error", Some(&error_msg))?;
                     }
                 }
             }
@@ -304,10 +593,7 @@ fn process_element_children(result: &mut String, element: &ElementRef) {
     }
 }
 
-fn send_to_telegram(item: &NewsItem) -> Result<()> {
-    let token = env::var("TG_TOKEN").context("Failed to get TG_TOKEN")?;
-    let chat_id = env::var("TG_CHAT_ID").context("Failed to get TG_CHAT_ID")?;
-    
+async fn send_to_telegram(tg: &TelegramContext, item: &NewsItem) -> Result<()> {
     let file_path = format!("{}/publisher_{}.html", DATA_DIR, item.id);
     let image_path = format!("{}/illustrator_{}.png", DATA_DIR, item.id);
     
@@ -327,167 +613,29 @@ fn send_to_telegram(item: &NewsItem) -> Result<()> {
     content.push_str(&format!("\n\nОпубликовано: {}\n<a href=\"{}\">Читать оригинал</a>", 
                               formatted_date, item.url));
 
-    // Always: send photo WITHOUT caption, then send the post as a separate message.
     if !Path::new(&image_path).exists() {
         return Err(anyhow!("Illustrator image not found: {}", image_path));
     }
 
-    let client = Client::new();
+    // Post photo + HTML caption in a single message (user API via grammers).
+    // Evidence (pinned grammers git revision used by Cargo):
+    // - InputMessage::new().html(...).photo(...):
+    //   https://github.com/Lonami/grammers/blob/e15d820169462839173b60c3b69e0aebbeae848d/grammers-client/src/types/input_message.rs
+    // - Client::send_message(peer, message):
+    //   https://github.com/Lonami/grammers/blob/e15d820169462839173b60c3b69e0aebbeae848d/grammers-client/src/client/messages.rs
+    let uploaded = tg
+        .client
+        .upload_file(&image_path)
+        .await
+        .context("Failed to upload photo to Telegram")?;
 
-    send_photo(&client, &token, &chat_id, &image_path, None)?;
-    send_message_no_fallback(&client, &token, &chat_id, &content)?;
-    Ok(())
-}
-
-fn send_photo(client: &Client, token: &str, chat_id: &str, image_path: &str, caption: Option<&str>) -> Result<()> {
-    let url = format!("https://api.telegram.org/bot{}/sendPhoto", token);
-
-    let image_bytes = fs::read(image_path)
-        .context(format!("Failed to read illustrator image: {}", image_path))?;
-
-    let mut form = multipart::Form::new()
-        .text("chat_id", chat_id.to_string())
-        .part(
-            "photo",
-            multipart::Part::bytes(image_bytes)
-                .file_name(
-                    Path::new(image_path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .mime_str("image/png")
-                .context("Failed to set mime type for photo")?,
-        )
-        .text("parse_mode", "HTML".to_string());
-
-    if let Some(c) = caption {
-        form = form.text("caption", c.to_string());
-    }
-
-    let response = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .context("Failed to send sendPhoto request to Telegram API")?;
-
-    if !response.status().is_success() {
-        let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow!("Telegram API error (sendPhoto): {}", error_text));
-    }
+    let message = InputMessage::new().html(&content).photo(uploaded);
+    tg.client
+        .send_message(tg.target_chat, message)
+        .await
+        .context("Failed to send message to Telegram")?;
 
     Ok(())
-}
-
-fn send_message_no_fallback(
-    client: &Client,
-    token: &str,
-    chat_id: &str,
-    html_message: &str,
-) -> Result<()> {
-    // Telegram Bot API sendMessage: text is limited to 1-4096 characters AFTER entities parsing.
-    // We approximate by stripping HTML tags and counting UTF-16 code units.
-    let approx_len_utf16 = telegram_text_len_utf16_after_entities_guess(html_message);
-    if approx_len_utf16 > TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16 {
-        return Err(anyhow!(
-            "Telegram message too long (approx {} UTF-16 units, limit {}). No fallback is configured.",
-            approx_len_utf16,
-            TELEGRAM_SENDMESSAGE_TEXT_LIMIT_UTF16
-        ));
-    }
-
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-    let response = client
-        .post(&url)
-        .json(&json!({
-            "chat_id": chat_id,
-            "text": html_message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": true
-        }))
-        .send()
-        .context("Failed to send request to Telegram API")?;
-
-    if !response.status().is_success() {
-        let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow!("Telegram API error (sendMessage): {}", error_text));
-    }
-
-    Ok(())
-}
-
-fn telegram_text_len_utf16_after_entities_guess(html_text: &str) -> usize {
-    // Very rough approximation of "after entities parsing":
-    // 1) remove tags, turning them into whitespace; 2) collapse whitespace; 3) count UTF-16 code units.
-    let plain = strip_html_tags_to_text(html_text);
-    plain.encode_utf16().count()
-}
-
-fn strip_html_tags_to_text(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    let mut last_was_space = false;
-
-    let mut tag_buf = String::new();
-
-    for ch in html.chars() {
-        if in_tag {
-            if ch == '>' {
-                in_tag = false;
-
-                // For some block-ish tags, add a space/newline to keep words separated.
-                let tag = tag_buf.trim().to_lowercase();
-                if (tag.starts_with("br") || tag.starts_with("/p") || tag.starts_with("p")) && !last_was_space {
-                    out.push(' ');
-                    last_was_space = true;
-                }
-                tag_buf.clear();
-            } else {
-                tag_buf.push(ch);
-            }
-            continue;
-        }
-
-        if ch == '<' {
-            in_tag = true;
-            if !last_was_space {
-                out.push(' ');
-                last_was_space = true;
-            }
-            continue;
-        }
-
-        if ch.is_whitespace() {
-            if !last_was_space {
-                out.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_was_space = false;
-        }
-    }
-
-    out.trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_html_tags_basic() {
-        let s = "<b>Hello</b> <a href=\"https://example.com\">world</a><br>!";
-        assert_eq!(strip_html_tags_to_text(s), "Hello world !");
-    }
-
-    #[test]
-    fn telegram_len_uses_utf16() {
-        // 😀 is 2 UTF-16 code units
-        let s = "😀";
-        assert_eq!(telegram_text_len_utf16_after_entities_guess(s), 2);
-    }
 }
 
 // Function to parse and format the date
@@ -561,30 +709,4 @@ fn log(message: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// Function to extract retry_after value from Telegram API error message
-fn extract_retry_after(error_msg: &str) -> Option<u64> {
-    // Parse JSON error response to extract retry_after value
-    if let Some(start) = error_msg.find("retry_after") {
-        if let Some(value_start) = error_msg[start..].find(":") {
-            // Get the substring after "retry_after:"
-            let value_str = &error_msg[start + value_start + 1..];
-            
-            // Parse the number (handling potential commas and end quotes)
-            let mut num_str = String::new();
-            for c in value_str.chars() {
-                if c.is_ascii_digit() {
-                    num_str.push(c);
-                } else if !num_str.is_empty() {
-                    // Stop at first non-digit after we've seen digits
-                    break;
-                }
-            }
-            
-            // Convert to u64
-            if !num_str.is_empty() {
-                return num_str.parse::<u64>().ok();
-            }
-        }
-    }
-    None
-}
+// Note: Bot API specific retry-after parsing was removed when migrating to user API.
