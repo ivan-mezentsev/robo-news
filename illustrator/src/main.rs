@@ -472,7 +472,10 @@ fn illustrate_content(content: &str, provider: &AiProviderConfig, prompt: &str) 
             let request = OpenRouterChatRequest {
                 model: provider.model.clone(),
                 messages,
-                modalities: vec!["image".to_string(), "text".to_string()],
+                // Request only image output.
+                // Some models/providers may not support combined output modalities (image + text),
+                // which can lead to: "No endpoints found that support the requested output modalities".
+                modalities: vec!["image".to_string()],
                 reasoning: provider.reasoning.clone(),
             };
 
