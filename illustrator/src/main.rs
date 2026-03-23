@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use image::ImageFormat;
 use rusqlite::{params, Connection, Row};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write, stdout};
+use std::io::{Cursor, Read, Write, stdout};
 use std::path::Path;
 use std::{thread, time::Duration};
 use std::sync::Arc;
@@ -14,11 +15,14 @@ use thiserror::Error;
 const DB_PATH: &str = "data/news.db";
 const DATA_DIR: &str = "data";
 const ILLUSTRATE_INTERVAL_SECS: u64 = 60; // Reduce interval for testing
+const XAI_DEFAULT_ASPECT_RATIO: &str = "auto";
+const XAI_DEFAULT_RESOLUTION: &str = "1k";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AiProviderType {
     OpenRouter,
     Gemini,
+    Xai,
 }
 
 impl AiProviderType {
@@ -26,12 +30,19 @@ impl AiProviderType {
         match value.trim().to_ascii_lowercase().as_str() {
             "openrouter" => Ok(Self::OpenRouter),
             "gemini" => Ok(Self::Gemini),
+            "xai" => Ok(Self::Xai),
             other => Err(anyhow!(
-                "AI_PROVIDER_ILLUSTRATOR_TYPE must be either 'OpenRouter' or 'Gemini' for illustrator service (got '{}')",
+                "AI_PROVIDER_ILLUSTRATOR_TYPE must be either 'OpenRouter', 'Gemini', or 'XAI' for illustrator service (got '{}')",
                 other
             )),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct XaiImageConfig {
+    aspect_ratio: String,
+    resolution: String,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +52,7 @@ struct AiProviderConfig {
     model: String,
     prompt: String,
     reasoning: Option<ReasoningConfig>,
+    xai_image_config: Option<XaiImageConfig>,
 }
 
 struct NewsItem {
@@ -63,6 +75,15 @@ struct OpenRouterChatRequest {
     modalities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Serialize)]
+struct XaiImageGenerationRequest {
+    model: String,
+    prompt: String,
+    aspect_ratio: String,
+    resolution: String,
+    response_format: String,
 }
 
 // Gemini image generation (text-to-image) docs:
@@ -187,6 +208,23 @@ struct ResponseImageUrl {
     url: String,
 }
 
+#[derive(Deserialize, Debug)]
+struct XaiImageGenerationResponse {
+    data: Vec<XaiGeneratedImage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct XaiGeneratedImage {
+    #[serde(default)]
+    b64_json: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    url: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    revised_prompt: Option<String>,
+}
+
 fn main() -> Result<()> {
     // Check required environment variables
     let provider_type = AiProviderType::parse(
@@ -202,6 +240,7 @@ fn main() -> Result<()> {
         .context("AI_PROVIDER_ILLUSTRATOR_API_KEY environment variable not set")?;
 
     let reasoning = read_ai_provider_reasoning_from_env();
+    let xai_image_config = read_xai_image_config_from_env(provider_type)?;
 
     let provider = AiProviderConfig {
         provider_type,
@@ -209,6 +248,7 @@ fn main() -> Result<()> {
         model,
         prompt,
         reasoning,
+        xai_image_config,
     };
     
     // Initialize database and data directory
@@ -412,6 +452,13 @@ fn process_news_item(item: &NewsItem, provider: &AiProviderConfig) -> Result<Opt
             // Convert ApiError directly to anyhow::Error
             return Err(anyhow!(e.clone()));
         }
+        Err(ref e @ ApiError::ConfigurationError(_)) => {
+            write_log(&format!(
+                "[ERROR] Invalid illustrator provider configuration for item {}: {}. No image to save.",
+                item.id, e
+            ))?;
+            return Err(anyhow!(e.clone()));
+        }
         Err(ApiError::ApiReturnedError { .. }) => {
             // Controlled error: we return finish_reason to let caller set illustrator_retry.
         }
@@ -530,7 +577,109 @@ fn illustrate_content(content: &str, provider: &AiProviderConfig, prompt: &str) 
 
             parse_gemini_image_from_generate_content_response(response)
         }
+        AiProviderType::Xai => {
+            // xAI image generation docs:
+            // - POST https://api.x.ai/v1/images/generations
+            // - Request body supports: model, prompt, aspect_ratio, resolution, response_format
+            // - With response_format="b64_json", image data is returned in data[0].b64_json
+            // Sources:
+            // - https://docs.x.ai/developers/model-capabilities/images/generation
+            // - https://docs.x.ai/developers/rest-api-reference/inference/images
+            let xai_image_config = provider
+                .xai_image_config
+                .as_ref()
+                .ok_or_else(|| ApiError::ConfigurationError("XAI image configuration is missing".to_string()))?;
+
+            let user_prompt = format!("{}\n\n{}", prompt, content);
+            let request = XaiImageGenerationRequest {
+                model: provider.model.clone(),
+                prompt: user_prompt,
+                aspect_ratio: xai_image_config.aspect_ratio.clone(),
+                resolution: xai_image_config.resolution.clone(),
+                response_format: "b64_json".to_string(),
+            };
+
+            let _ = write_log(&format!(
+                "[DEBUG] Request summary: provider='XAI', model='{}', aspect_ratio='{}', resolution='{}', prompt_len={}, html_len={}",
+                provider.model,
+                xai_image_config.aspect_ratio,
+                xai_image_config.resolution,
+                prompt.len(),
+                content.len()
+            ));
+
+            let response = client
+                .post("https://api.x.ai/v1/images/generations")
+                .header("Authorization", format!("Bearer {}", provider.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .map_err(|e| ApiError::RequestError(Arc::new(e)))?;
+
+            parse_xai_image_from_generation_response(response)
+        }
     }
+}
+
+fn parse_xai_image_from_generation_response(
+    response: reqwest::blocking::Response,
+) -> Result<(Vec<u8>, Option<String>), ApiError> {
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|e| ApiError::RequestError(Arc::new(e)))?;
+
+    if !status.is_success() {
+        let _ = write_log(&format!(
+            "[WARN] XAI returned non-success status: {}. Body: {}",
+            status,
+            truncate_for_log(&response_text, 2000)
+        ));
+        return Err(ApiError::ApiReturnedError {
+            status,
+            content: response_text,
+            finish_reason: Some("error".to_string()),
+        });
+    }
+
+    let response_data: XaiImageGenerationResponse = match serde_json::from_str(&response_text) {
+        Ok(data) => data,
+        Err(e) => {
+            let _ = write_log(&format!(
+                "[ERROR] Failed to parse XAI image generation JSON. Status: {}. Body: {}",
+                status,
+                truncate_for_log(&response_text, 2000)
+            ));
+            return Err(ApiError::ParseError(Arc::new(e.into())));
+        }
+    };
+
+    let _ = write_log(&format!(
+        "[DEBUG] XAI response summary: images={}",
+        response_data.data.len()
+    ));
+
+    let image = response_data.data.first().ok_or(ApiError::EmptyImageData)?;
+    let b64_json = image.b64_json.as_deref().ok_or(ApiError::EmptyImageData)?;
+
+    let raw_image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_json)
+        .map_err(|e| ApiError::ParseError(Arc::new(anyhow!(e))))?;
+
+    let _ = write_log(&format!(
+        "[DEBUG] XAI raw image bytes received: {}",
+        raw_image_bytes.len()
+    ));
+
+    let image_bytes = normalize_xai_image_bytes_to_png(&raw_image_bytes)
+        .map_err(|e| ApiError::ParseError(Arc::new(e)))?;
+
+    let _ = write_log(&format!(
+        "[DEBUG] XAI normalized PNG bytes received: {}",
+        image_bytes.len()
+    ));
+
+    Ok((image_bytes, None))
 }
 
 fn parse_gemini_image_from_generate_content_response(
@@ -734,6 +883,121 @@ fn truncate_for_log(s: &str, max_len: usize) -> String {
     )
 }
 
+fn read_xai_image_config_from_env(provider_type: AiProviderType) -> Result<Option<XaiImageConfig>> {
+    if provider_type != AiProviderType::Xai {
+        return Ok(None);
+    }
+
+    let aspect_ratio = read_xai_aspect_ratio_from_env()?;
+    let resolution = read_xai_resolution_from_env()?;
+
+    Ok(Some(XaiImageConfig {
+        aspect_ratio,
+        resolution,
+    }))
+}
+
+fn read_xai_aspect_ratio_from_env() -> Result<String> {
+    match env::var("AI_PROVIDER_ILLUSTRATOR_ASPECT_RATIO") {
+        Ok(value) => parse_xai_aspect_ratio(&value),
+        Err(env::VarError::NotPresent) => Ok(XAI_DEFAULT_ASPECT_RATIO.to_string()),
+        Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
+            "AI_PROVIDER_ILLUSTRATOR_ASPECT_RATIO contains invalid unicode"
+        )),
+    }
+}
+
+fn read_xai_resolution_from_env() -> Result<String> {
+    match env::var("AI_PROVIDER_ILLUSTRATOR_RESOLUTION") {
+        Ok(value) => parse_xai_resolution(&value),
+        Err(env::VarError::NotPresent) => Ok(XAI_DEFAULT_RESOLUTION.to_string()),
+        Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
+            "AI_PROVIDER_ILLUSTRATOR_RESOLUTION contains invalid unicode"
+        )),
+    }
+}
+
+fn parse_xai_aspect_ratio(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "AI_PROVIDER_ILLUSTRATOR_ASPECT_RATIO must not be empty"
+        ));
+    }
+
+    const ALLOWED_ASPECT_RATIOS: [&str; 13] = [
+        "1:1",
+        "16:9",
+        "9:16",
+        "4:3",
+        "3:4",
+        "3:2",
+        "2:3",
+        "2:1",
+        "1:2",
+        "19.5:9",
+        "9:19.5",
+        "20:9",
+        "9:20",
+    ];
+
+    if normalized == XAI_DEFAULT_ASPECT_RATIO
+        || ALLOWED_ASPECT_RATIOS.contains(&normalized.as_str())
+    {
+        return Ok(normalized);
+    }
+
+    Err(anyhow!(
+        "AI_PROVIDER_ILLUSTRATOR_ASPECT_RATIO has invalid value '{}'. Allowed: auto|1:1|16:9|9:16|4:3|3:4|3:2|2:3|2:1|1:2|19.5:9|9:19.5|20:9|9:20",
+        value.trim()
+    ))
+}
+
+fn parse_xai_resolution(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "AI_PROVIDER_ILLUSTRATOR_RESOLUTION must not be empty"
+        ));
+    }
+
+    match normalized.as_str() {
+        "1k" | "2k" => Ok(normalized),
+        _ => Err(anyhow!(
+            "AI_PROVIDER_ILLUSTRATOR_RESOLUTION has invalid value '{}'. Allowed: 1k|2k",
+            value.trim()
+        )),
+    }
+}
+
+fn normalize_xai_image_bytes_to_png(image_bytes: &[u8]) -> Result<Vec<u8>> {
+    if looks_like_png(image_bytes) {
+        return Ok(image_bytes.to_vec());
+    }
+
+    let image_format = image::guess_format(image_bytes)
+        .context("Failed to determine XAI image format from response bytes")?;
+
+    match image_format {
+        ImageFormat::Jpeg | ImageFormat::Png => {}
+        other => {
+            return Err(anyhow!(
+                "XAI returned unsupported image format: {:?}. Expected JPEG or PNG",
+                other
+            ));
+        }
+    }
+
+    let decoded_image = image::load_from_memory_with_format(image_bytes, image_format)
+        .context("Failed to decode XAI image bytes")?;
+    let mut png_bytes = Cursor::new(Vec::new());
+    decoded_image
+        .write_to(&mut png_bytes, ImageFormat::Png)
+        .context("Failed to encode XAI image as PNG")?;
+
+    Ok(png_bytes.into_inner())
+}
+
 fn read_ai_provider_reasoning_from_env() -> Option<ReasoningConfig> {
     // Env-driven, optional behavior:
     // - if neither env is provided (or both empty), behave as before (no `reasoning` field)
@@ -838,6 +1102,8 @@ enum ApiError {
     RequestError(#[from] Arc<reqwest::Error>),
     #[error("Failed to parse API response: {0}")]
     ParseError(#[from] Arc<anyhow::Error>),
+    #[error("Invalid illustrator provider configuration: {0}")]
+    ConfigurationError(String),
     #[error("AI provider returned status {status} with finish_reason '{finish_reason:?}'. Body: {content}")]
     ApiReturnedError {
         status: reqwest::StatusCode,
