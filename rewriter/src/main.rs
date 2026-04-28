@@ -39,6 +39,7 @@ impl AiProviderType {
 struct AiProviderConfig {
     provider_type: AiProviderType,
     api_key: String,
+    api_url: Option<String>,
     model: String,
     prompt: String,
     reasoning: Option<ReasoningConfig>,
@@ -135,12 +136,16 @@ fn main() -> Result<()> {
     let model = env::var("AI_PROVIDER_REWRITER_MODEL").context("AI_PROVIDER_REWRITER_MODEL environment variable not set")?;
     let prompt = env::var("AI_PROVIDER_REWRITER_PROMPT").context("AI_PROVIDER_REWRITER_PROMPT environment variable not set")?;
     let api_key = env::var("AI_PROVIDER_REWRITER_API_KEY").context("AI_PROVIDER_REWRITER_API_KEY environment variable not set")?;
+    let api_url = env::var("AI_PROVIDER_REWRITER_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     let reasoning = read_ai_provider_reasoning_from_env();
 
     let provider = AiProviderConfig {
         provider_type,
         api_key,
+        api_url,
         model,
         prompt,
         reasoning,
@@ -472,6 +477,10 @@ fn rewrite_content(content: &str, provider: &AiProviderConfig, prompt: &str) -> 
             //   POST https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
             // Auth:
             //   Authorization: Bearer <GEMINI_API_KEY>
+            let api_url = provider
+                .api_url
+                .as_deref()
+                .unwrap_or("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
             let reasoning_effort = gemini_reasoning_effort_from_reasoning(&provider.reasoning);
             if let Some(ref effort) = reasoning_effort {
                 let _ = write_log(&format!(
@@ -492,7 +501,7 @@ fn rewrite_content(content: &str, provider: &AiProviderConfig, prompt: &str) -> 
             ));
 
             let response = client
-                .post("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+                .post(api_url)
                 .header("Authorization", format!("Bearer {}", provider.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
