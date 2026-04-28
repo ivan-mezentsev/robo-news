@@ -39,6 +39,7 @@ impl AiProviderType {
 struct AiProviderConfig {
     provider_type: AiProviderType,
     api_key: String,
+    api_url: Option<String>,
     model: String,
     prompt: String,
     prompt_cut: String,
@@ -136,6 +137,9 @@ fn main() -> Result<()> {
     let model = env::var("AI_PROVIDER_TRANSLATOR_MODEL").context("AI_PROVIDER_TRANSLATOR_MODEL environment variable not set")?;
     let prompt = env::var("AI_PROVIDER_TRANSLATOR_PROMPT").context("AI_PROVIDER_TRANSLATOR_PROMPT environment variable not set")?;
     let api_key = env::var("AI_PROVIDER_TRANSLATOR_API_KEY").context("AI_PROVIDER_TRANSLATOR_API_KEY environment variable not set")?;
+    let api_url = env::var("AI_PROVIDER_TRANSLATOR_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     // Optional environment variable (can be empty)
     let prompt_cut = env::var("AI_PROVIDER_TRANSLATOR_PROMPT_CUT").unwrap_or_else(|_| {
@@ -148,6 +152,7 @@ fn main() -> Result<()> {
     let provider = AiProviderConfig {
         provider_type,
         api_key,
+        api_url,
         model,
         prompt,
         prompt_cut,
@@ -537,6 +542,10 @@ fn translate_content(content: &str, provider: &AiProviderConfig, prompt: &str) -
             //   POST https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
             // Auth:
             //   Authorization: Bearer <GEMINI_API_KEY>
+            let api_url = provider
+                .api_url
+                .as_deref()
+                .unwrap_or("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
             let reasoning_effort = gemini_reasoning_effort_from_reasoning(&provider.reasoning);
             if let Some(ref effort) = reasoning_effort {
                 let _ = write_log(&format!(
@@ -557,7 +566,7 @@ fn translate_content(content: &str, provider: &AiProviderConfig, prompt: &str) -
             ));
 
             let response = client
-                .post("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+                .post(api_url)
                 .header("Authorization", format!("Bearer {}", provider.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
