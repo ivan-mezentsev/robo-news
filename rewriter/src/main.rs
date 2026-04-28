@@ -79,6 +79,8 @@ struct GeminiChatRequest {
     model: String,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
 }
 
@@ -492,6 +494,7 @@ fn rewrite_content(content: &str, provider: &AiProviderConfig, prompt: &str) -> 
             let request = GeminiChatRequest {
                 model: provider.model.clone(),
                 messages,
+                stream: provider.api_url.as_ref().map(|_| false),
                 reasoning_effort,
             };
 
