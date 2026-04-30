@@ -49,6 +49,7 @@ struct XaiImageConfig {
 struct AiProviderConfig {
     provider_type: AiProviderType,
     api_key: String,
+    api_url: Option<String>,
     model: String,
     prompt: String,
     reasoning: Option<ReasoningConfig>,
@@ -238,6 +239,9 @@ fn main() -> Result<()> {
         .context("AI_PROVIDER_ILLUSTRATOR_PROMPT environment variable not set")?;
     let api_key = env::var("AI_PROVIDER_ILLUSTRATOR_API_KEY")
         .context("AI_PROVIDER_ILLUSTRATOR_API_KEY environment variable not set")?;
+    let api_url = env::var("AI_PROVIDER_ILLUSTRATOR_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     let reasoning = read_ai_provider_reasoning_from_env();
     let xai_image_config = read_xai_image_config_from_env(provider_type)?;
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
     let provider = AiProviderConfig {
         provider_type,
         api_key,
+        api_url,
         model,
         prompt,
         reasoning,
@@ -531,8 +536,13 @@ fn illustrate_content(content: &str, provider: &AiProviderConfig, prompt: &str) 
                 provider.model
             ));
 
+            let api_url = provider
+                .api_url
+                .as_deref()
+                .unwrap_or("https://openrouter.ai/api/v1/chat/completions");
+
             let response = client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(api_url)
                 .header("Authorization", format!("Bearer {}", provider.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -566,9 +576,10 @@ fn illustrate_content(content: &str, provider: &AiProviderConfig, prompt: &str) 
                 "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
                 provider.model
             );
+            let api_url = provider.api_url.as_deref().unwrap_or(url.as_str());
 
             let response = client
-                .post(url)
+                .post(api_url)
                 .header("x-goog-api-key", provider.api_key.clone())
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -608,8 +619,13 @@ fn illustrate_content(content: &str, provider: &AiProviderConfig, prompt: &str) 
                 content.len()
             ));
 
+            let api_url = provider
+                .api_url
+                .as_deref()
+                .unwrap_or("https://api.x.ai/v1/images/generations");
+
             let response = client
-                .post("https://api.x.ai/v1/images/generations")
+                .post(api_url)
                 .header("Authorization", format!("Bearer {}", provider.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
